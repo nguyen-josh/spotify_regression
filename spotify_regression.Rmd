@@ -1,0 +1,660 @@
+---
+title: "Does Success in Music Lead Artists to Sell Out?"
+date: "5/10/2026"
+author: "Josh Nguyen
+output:
+  pdf_document:
+    latex_engine: xelatex
+    number_sections: true
+geometry: margin=0.9in
+fontsize: 11pt
+header-includes:
+  - '\usepackage{booktabs}'
+  - '\usepackage{float}'
+  - '\usepackage{titlesec}'
+  - '\floatplacement{figure}{H}'
+  - '\floatplacement{table}{H}'
+  - '\setlength{\textfloatsep}{6pt plus 1pt minus 1pt}'
+  - '\setlength{\intextsep}{6pt plus 1pt minus 1pt}'
+  - '\setlength{\abovecaptionskip}{2pt}'
+  - '\setlength{\belowcaptionskip}{2pt}'
+  - '\titlespacing*{\section}{0pt}{8pt}{4pt}'
+  - '\titlespacing*{\subsection}{0pt}{6pt}{2pt}'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 6,
+  fig.height = 3.5,
+  fig.align  = "center",
+  out.width  = "88%"
+)
+```
+
+
+```{r, include = FALSE}
+library(tidyverse)   
+library(sandwich)    
+library(lmtest)      
+library(corrplot)   
+library(knitr)
+library(kableExtra)
+library(gridExtra)
+```
+
+```{r, include = FALSE}
+
+df_raw <- read_csv("spotify_songs.csv")
+
+df <- df_raw |>
+  distinct(track_id, .keep_all = TRUE) |>
+  filter(!is.na(track_name)) |>
+  mutate(
+    release_date = as.Date(substr(track_album_release_date, 1, 10)),
+    release_year = as.numeric(substr(track_album_release_date, 1, 4)),
+    duration_min = duration_ms / 60000
+  )
+```
+
+```{r, include = FALSE}
+# We only want to look at artists with >= 5 songs and valid release dates, since we are trying to do some analysis on the careers of each artist from their consecutive tracks. There's not enough variation we can measure within an artist if they have less than 5 songs. 
+
+artist_counts <- df |> count(track_artist)
+
+df_panel <- df |>
+  left_join(artist_counts, by = "track_artist") |>
+  filter(n >= 5, !is.na(release_date)) |>
+
+  arrange(track_artist, release_date, desc(track_popularity)) |>
+  group_by(track_artist) |>
+  mutate(release_order = row_number()) |>
+  ungroup()
+
+# we want to only do our analysis based on genre, so we are comparing based on other artists within the same genre
+m_base <- lm(track_popularity ~ playlist_genre, data = df_panel)
+df_panel$pop_resid <- residuals(m_base)
+# Genre centroids for directional sound change
+# Compute each artist's genre centroid from all other artists in that 
+# genre, excluding the focal artist's own songs. Prevents prolific or genre-defining
+# from otherwise pulling the centroid toward their own sound, making their own
+# dist_from_centroid artificially close to zero
+audio_features <- c("danceability","energy","loudness","speechiness",
+                    "acousticness","instrumentalness","liveness","valence","tempo")
+
+# Genre-level sums and counts needed for efficient LOAO computation
+genre_sums <- df_panel |>
+  group_by(playlist_genre) |>
+  summarise(
+    sum_dance   = sum(danceability, na.rm = TRUE),
+    sum_energy  = sum(energy,       na.rm = TRUE),
+    sum_valence = sum(valence,      na.rm = TRUE),
+    n_genre     = n(),
+    .groups = "drop"
+  )
+
+# Artist-level sums within their genre
+artist_sums <- df_panel |>
+  group_by(track_artist, playlist_genre) |>
+  summarise(
+    artist_sum_dance   = sum(danceability, na.rm = TRUE),
+    artist_sum_energy  = sum(energy,       na.rm = TRUE),
+    artist_sum_valence = sum(valence,      na.rm = TRUE),
+    n_artist            = n(),
+    .groups = "drop"
+  )
+
+# Centroid = (genre_sum - artist_sum) / (n_genre - n_artist)
+loao_centroids <- artist_sums |>
+  left_join(genre_sums, by = "playlist_genre") |>
+  mutate(
+    # Prevents division by zero if an artist is the only one in the genre
+    safe_denom = if_else(n_genre > n_artist, n_genre - n_artist, 1L),
+    loao_dance   = (sum_dance   - artist_sum_dance)   / safe_denom,
+    loao_energy  = (sum_energy  - artist_sum_energy)  / safe_denom,
+    loao_valence = (sum_valence - artist_sum_valence) / safe_denom
+  ) |>
+  select(track_artist, playlist_genre, loao_dance, loao_energy, loao_valence)
+
+df_panel <- df_panel |>
+  left_join(loao_centroids, by = c("track_artist", "playlist_genre")) |>
+  mutate(
+    dist_from_centroid = sqrt(
+      (danceability - loao_dance)^2  +
+      (energy       - loao_energy)^2 +
+      (valence      - loao_valence)^2
+    )
+  )
+
+# For each artist, lag key variables by one position
+df_panel <- df_panel |>
+  group_by(track_artist) |>
+  mutate(
+    prev_pop_resid          = lag(pop_resid),
+    prev_popularity         = lag(track_popularity),
+    prev_dist_from_centroid = lag(dist_from_centroid),
+    # Track previous album ID so we can exclude intra-album pairs
+    prev_track_album_id     = lag(track_album_id),
+    across(all_of(audio_features), lag, .names = "prev_{.col}")
+  ) |>
+  ungroup()
+
+# Pooled SDs for sound_change_full standardization
+# Compute each feature's SD from the full panel before subsetting
+# to consecutive pairs. Pooled SD from the full panel reflects the actual variance of each feature across all observations, making the contribution of each feature comparable 
+panel_sds <- df_panel |>
+  summarise(across(all_of(audio_features), ~ sd(.x, na.rm = TRUE))) |>
+  as.list()
+
+# Sound change variables
+df_lag <- df_panel |>
+  filter(!is.na(prev_pop_resid), !is.na(prev_danceability)) |>
+  mutate(
+    # Same-album pair flag
+    # Same album songs cannot be a pair: both songs were recorded concurrently with no
+    # intervening decision about sound change
+    same_album_pair = (!is.na(track_album_id) &
+                       !is.na(prev_track_album_id) &
+                       track_album_id == prev_track_album_id),
+    
+    sound_change = sqrt(
+      (danceability - prev_danceability)^2 +
+      (energy       - prev_energy)^2       +
+      (valence      - prev_valence)^2
+    ),
+    
+    # Directional: positive = artist moved toward genre mainstream ("selling out"),
+    # negative = artist moved away from mainstream (experimentation / genre-switching)
+    centroid_approach = prev_dist_from_centroid - dist_from_centroid,
+
+    # Alternative: 9-feature magnitude (robustness check)
+    # All features are z-score standardized by pooled panel SD so every dimension
+    # contributes equally in variance units
+    
+    sound_change_full = sqrt(
+      ((danceability     - prev_danceability)     / panel_sds$danceability)^2     +
+      ((energy           - prev_energy)           / panel_sds$energy)^2           +
+      ((valence          - prev_valence)           / panel_sds$valence)^2          +
+      ((acousticness     - prev_acousticness)     / panel_sds$acousticness)^2     +
+      ((tempo            - prev_tempo)            / panel_sds$tempo)^2            +
+      ((loudness         - prev_loudness)         / panel_sds$loudness)^2         +
+      ((speechiness      - prev_speechiness)      / panel_sds$speechiness)^2      +
+      ((instrumentalness - prev_instrumentalness) / panel_sds$instrumentalness)^2 +
+      ((liveness         - prev_liveness)         / panel_sds$liveness)^2
+    )
+  ) |>
+  # Drop intra-album pairs
+  # Both songs must come from different albums to be evident of pursuing past success
+  
+  filter(!same_album_pair)
+
+n_raw_pairs   <- df_panel |>
+  filter(!is.na(prev_pop_resid), !is.na(prev_danceability)) |>
+  nrow()
+n_same_album  <- df_panel |>
+  filter(!is.na(prev_pop_resid), !is.na(prev_danceability)) |>
+  filter(!is.na(track_album_id),
+         !is.na(prev_track_album_id),
+         track_album_id == prev_track_album_id) |>
+  nrow()
+
+cat("Tracks:", nrow(df_panel), "\n")
+cat("Consecutive pairs (before album filter):", n_raw_pairs, "\n")
+cat("Same-album pairs dropped:", n_same_album,
+    sprintf("(%.1f%% of raw pairs)\n", 100 * n_same_album / n_raw_pairs))
+cat("Cross-album pairs (analysis sample):", nrow(df_lag), "\n")
+cat("Artists in pairs:", n_distinct(df_lag$track_artist), "\n")
+```
+
+# Introduction
+
+When a musician releases a song that becomes more popular than they expect, one would assume that the artist starts to make more music that sounds like it. Even though it may deviate from the sound that their "true fans" followed them for, in order to chase the money, chase the sound that led to the hit. This is commonly known as "selling out", which is where an artist will abandon their unique sound for whatever is successful. 
+
+However, we also know that some part of a song's popularity is driven by statistical noise that we can't predict, like good timing, or just performing well on Spotify's algorithm, causing it to recommend the song more. If an artist mistakes this noise for signal and they adjust their sound, their next song might not be the hit they were expecting. This is what we have studied as regression to the mean, which is why extreme outcomes like an artist's hit partly reflect luck, and that luck doesn't mean that changing their sound would be of any help commercially. 
+
+Our group looks to answer two questions related to this phenomenon. First, we want to understand whether or not popularity is something that sticks around across multiple songs. For example, if a song outperforms the average of it's genre, will the next song the artist creates do the same thing? Secondly, we want to understand whether the previous song's sound predicts the popularity of the next song. If an artist changes their sound, does that help them avoid regression to the mean?
+
+It's important to note that we are looking to answer questions related to inference. We are not necessarily looking to predict popularity of the next song an artist creates given their past music, we are trying to understand if "selling out" is a real phenomenon and if it actually succeeds in making an artist more popular. Another thing that want to look at is not only do we want to see whether changing the sound helps or hurts, but also the direction of the change. In other words, how much does an artist moving towards the mainstream vs. away from it affect the popularity of the songs?
+
+To answer this, we build three linear models, each being more complex and expressive than the last, and we use the F-test to understand whether each new layer of regressors helps explain our phenomena. We also make sure to provide the changes in R² and effect sizes to assess whether adding complexity to our model adds any meaningful signal or not, especially since at our large sample size, the F-test is too sensitive to tell us any good information.
+
+
+# Data
+
+## Dataset
+
+The Spotify Songs dataset contains 32,833 track observations collected from the Spotify API in late 2019. After we removed the duplicates so that there was only one row per unique `track_id`, we keep `r nrow(df)` unique songs across `r n_distinct(df$track_artist)` artists spanning six genres, those being EDM, Latin, Pop, R&B, Rap, and Rock.
+
+## Data Cleaning
+
+Since we wanted to look at popularity dynamics within a specific artist's career, we need to make sure we have enough variation for that artist specifically, and so we only used artists that had at least 5 songs and valid release dates, so that we could sequentially order the tracks for our specific analysis. This gave us `r nrow(df_panel)` tracks from `r n_distinct(df_panel$track_artist)` artists sorted chronologically. What's unique about our analysis is that the main unit of observation in our regressions is a consecutive pair of songs **between album cycles**, so our training data is in the form of (song $n-1$, song $n$) by the same artist, giving us  `r format(n_raw_pairs, big.mark=",")` raw pairs. We drop intra-album pairs because all of the tracks on an album share the same release date, which makes within-album ordering fairly arbitrary and would not align with the analysis that we are trying to make. This removes `r format(n_same_album, big.mark=",")` pairs, which leaves us with `r format(nrow(df_lag), big.mark=",")` cross-album pairs from `r n_distinct(df_lag$track_artist)` artists.  When multiple tracks share a release date, we break ties by popularity, which means that the most popular track from a given album is treated as the most recent before a cross-album transition.
+
+## Mutated Variables
+
+Along with our data cleaning, we wanted to obtain new variables apart from the ones already in the data, mainly to summarize certain aspects such as "sound change", which we had to estimate using specific properties of the sound that we found important, as well as projecting out some confounding factors that we felt would harm our results. 
+
+Below are the two mutated variables we created and why:
+
+**Controlling for genre fixed effects** When taking a look into the data, we found that the raw popularity of a song is related by genre, as pop songs averaged a popularity of ~52 while EDM averages ~32. To make sure that we are only analyzing intra-genre signal, we regressed popularity on genre fixed effects, and then we used the residuals:
+
+
+$$\text{pop\_resid}_n = \text{popularity}_n - \hat{\alpha}_{\text{genre}(n)}$$
+This "demeans" the songs, which is what is done when we remove the fixed effects. For example, a residual value of +15 means a song outperformed its genre average by 15 points
+
+**Sound change** This is where we mutate a new value which is just the "distance" (when thinking about this from a geometric sense), between danceability, energy, and valence between a song and a song made prior by the same artist. We chose these because they were assumed to be the most important for a listening experience, including rhythm, intensity, and emotion. We made sure that we didn't use all nine audio features, since we would add some genre-specific features that don't tell us much about selling out. 
+
+$$\text{sound\_change}_n = \sqrt{(\Delta\text{danceability})^2 + (\Delta\text{energy})^2 + (\Delta\text{valence})^2}$$
+
+**Sound change direction (toward mainstream vs. away).** A limitation of the previous mutation is that it can't distinguish between an artist selling out, moving toward the genre mainstream, and an artist experimenting, so moving away towards a different genre. We want to capture this, so we compute the distance of each song from it's centroid for it's genre, which is the average danceability, energy, and valence of songs in that genre. 
+
+$$\text{centroid\_approach}_n = \text{dist\_centroid}_{n-1} - \text{dist\_centroid}_n$$
+
+Here, a positive value means the artist's current song is closer to the genre mainstream than their previous song, which would mean that they "sold out" and went mainstream, while a negative value means they moved further from the genre center.
+
+Importantly, we calculate each artist's genre centroid by excluding that artist, so the centroid for artist $a$ is the mean of all songs in that genre excluding artist $a$'s own songs. This is just because we want to make sure a "genre-defining" artist doesn't pull the centroid to their own sound, which makes the distance artificially small, since song $n$ would be compared against a centroid includes song $n$ itself.
+
+
+```{r, echo = FALSE, fig.width=6, fig.height=2.4, out.width="85%", fig.cap="(a) Distribution of songs per artist in the panel. Most artists contribute 5--15 songs. (b) Popularity scores after controlling for genre fixed-effects"}
+# Figure 1: two-panel descriptive figure
+songs_per <- df_panel %>%
+  group_by(track_artist) %>%
+  summarise(n_songs = max(release_order), .groups = "drop")
+
+p1 <- ggplot(songs_per, aes(x = pmin(n_songs, 100))) +
+  geom_histogram(binwidth = 2, fill = "#2166ac", color = "white",
+                 alpha = 0.85) +
+  labs(x = "Songs per artist ", y = "Number of artists",
+       title = "(a) Artist song counts") +
+  theme_classic(base_size = 9)
+
+p2 <- ggplot(df_lag, aes(x = pop_resid)) +
+  geom_histogram(binwidth = 3, fill = "#2166ac", color = "white", alpha = 0.85) +
+  geom_vline(xintercept = 0, color = "#d6604d", linetype = "dashed") +
+  labs(x = "Demeaned popularity score", y = "Count",
+       title = "(b) Popularity distribution (controlling for genre)") +
+  theme_classic(base_size = 9)
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+# Analysis
+
+With this in mind, we want to make estimates for three different linear models, each with increasing complexity. One thing to note is that we used the sandwich estimator to make sure that the standard errors were robust to heteroskedasticity, since the track popularity values were bounded between 0 and 100, songs near the extreme values couldn't deviate much from their predicted value, which make the residual variance at the tails a bit smaller. 
+
+Another thing that is really important is our standard errors and our F-tests. We cluster all standard errors by artist (`vcovCL`, `cluster = ~track_artist`), since songs by the same artist are not independent observations. Here, since there is a large set of data points, our F-test becomes very sensitive and will produce p-values near zero for most non-zero coefficients, which is why we also include R² changes to see if the additions in complexity are meaningful or not. 
+
+## Model 1: Does Popularity Stick Around Between Songs?
+
+We start off very simple, just by analyzing whether or not a song's genre-controlled popularity predict the popularity of the next song by the same artist (assume that all future instances of the word "popularity" refer to "genre-controlled popularity").
+
+$$\text{pop\_resid}_n = \alpha + \beta \cdot \text{pop\_resid}_{n-1} + \varepsilon_n$$
+
+```{r model1, include = FALSE}
+m1 <- lm(pop_resid ~ prev_pop_resid, data = df_lag)
+
+# Cluster standard errors by artist
+se1 <- sqrt(diag(vcovCL(m1, cluster = ~track_artist)))
+
+b1   <- coef(m1)["prev_pop_resid"]
+t1   <- b1 / se1["prev_pop_resid"]
+rtm  <- 1 - b1
+r2_1 <- summary(m1)$r.squared
+
+ci1_lo <- b1 - 1.96 * se1["prev_pop_resid"]
+ci1_hi <- b1 + 1.96 * se1["prev_pop_resid"]
+```
+
+
+We found that the OLS estimate is $\hat{\beta} = `r round(b1, 4)`$ (SE = `r round(se1["prev_pop_resid"], 4)`), R² = `r round(r2_1, 4)`. This means that approximately `r round(r2_1*100, 0)`% of the variation in a song's popularity can be predicted from just the previous song's popularity.
+
+
+So what is interesting here is the noise that regresses to the mean from this model $1 - \hat{\beta} = `r round(rtm, 3)`$. This means that `r round(rtm*100, 1)`% of any unexpected popularity in one song will regress to the mean in the next song. So, if a song has a popularity score of $10$, then we can only predict that the next song will have a popularity score of $`r round(b1*10, 2)`$, which means that roughly $`r round(10 - b1*10, 2)`$ points will go away. 
+
+The reason for why this is true is because of noise in defining the popularity of a song, which could include anything like a boost in the algorithm, or even just the fact that a famous influencer made a TikTok dance for it, which doesn't carry forward to future songs necessarily. 
+
+The 95% CI for $\hat{\beta}$ is $(`r round(ci1_lo, 3)`, `r round(ci1_hi, 3)`)$, which excludes both zero and one. This is meaningful because it confirms that popularity persistence is real, but it doesn't tell us everything, so the effect of a hit doesn't fully carry forward, but it doesn't fully evaporate either.
+
+```{r fig3-scatter, fig.width=5.5, fig.height=2.6, out.width="70%", fig.cap=paste0(" A scatterplot of consecutive song popularity (random sample of 2,500 pairs). The red OLS line ($\\hat{\\beta}$ = ", round(b1, 3), ") lies below the dotted 45\\textdegree\\ reference line, which tells us that there will be some regression to the mean. Each point is one consecutive-song pair by the same artist.")}
+
+
+set.seed(42)
+df_sample <- df_lag %>% sample_n(min(2500, nrow(df_lag)))
+
+ggplot(df_sample, aes(x = prev_pop_resid, y = pop_resid)) +
+  geom_point(alpha = 0.15, size = 0.8, color = "#2166ac") +
+  geom_smooth(method = "lm", se = TRUE, color = "#d6604d",
+              linewidth = 1.0, fill = "#d6604d", alpha = 0.15) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dotted", color = "grey50", linewidth = 0.8) +
+  labs(x = "Previous song popularity ",
+       y = "Current song popularity ", 
+       title = "Popularity for a single artist across songs") +
+  theme_classic(base_size = 9) +
+  annotate("text", x = 35, y = 10,
+           label = paste0("β̂ = ", round(b1, 3), " (OLS)"),
+           color = "#d6604d", size = 3)
+```
+
+
+## Model 2: Does Your Last Song's Sound Affect the Next One's Popularity?
+
+Now, we want to look at if the sound matters for affecting popularity. Specifically, what if two arts had a song that was above their genre average, but one was a slower song, while one was much more energetic. Our previous model treated these identically, but we want to know whether different sound types means that the popularity will stick around longer. 
+
+We make a more complex model, which adds 6 different audio features from the previous song.
+
+$$\begin{aligned}
+\mathtt{pop\_resid}_{n} = \alpha &+ \beta_1 \cdot \mathtt{pop\_resid}_{n-1} \\
+&+ \gamma_1\,\text{dance}_{n-1} + \gamma_2\,\text{energy}_{n-1} + \gamma_3\,\text{loud}_{n-1} \\
+&+ \gamma_4\,\text{acoustic}_{n-1} + \gamma_5\,\text{valence}_{n-1} + \gamma_6\,\text{tempo}_{n-1} + \varepsilon_{n}
+\end{aligned}$$
+
+```{r model2}
+m2 <- lm(pop_resid ~ prev_pop_resid +
+           prev_danceability + prev_energy + prev_loudness +
+           prev_acousticness + prev_valence + prev_tempo,
+         data = df_lag)
+
+
+se2 <- sqrt(diag(vcovCL(m2, cluster = ~track_artist)))
+r2_2 <- summary(m2)$r.squared
+
+
+Q12 <- length(coef(m2)) - length(coef(m1))   # number of new regressors = 6
+f_test_12 <- waldtest(m1, m2, vcov = vcovCL(m2, cluster = ~track_artist))
+F12 <- f_test_12$F[2]
+p12 <- f_test_12$`Pr(>F)`[2]
+
+# table
+m1_coefs <- c(round(coef(m1)["prev_pop_resid"], 3), rep("---", 6))
+m2_coefs <- round(coef(m2)[c("prev_pop_resid", "prev_danceability", "prev_energy",
+                              "prev_loudness", "prev_acousticness", 
+                              "prev_valence", "prev_tempo")], 3)
+
+simple_tbl <- data.frame(
+  Variable = c("prev pop resid", "prev danceability", "prev energy",
+               "prev loudness", "prev acousticness", "prev valence", "prev tempo"),
+  `Model 1` = m1_coefs,
+  `Model 2` = as.character(m2_coefs)
+)
+
+kable(simple_tbl, booktabs = TRUE,
+      col.names = c("Variable", "Model 1", "Model 2"),
+      caption = "Comparing coefficients between Model 1 and Model 2.") %>%
+  kable_styling(latex_options = "hold_position", font_size = 9)
+```
+
+
+From here, we also want to test the significance of these new sound factors (we are doing inference after all!) so, we use a cluster-robust Wald F-test to compare the two models that we have made so far. Our results were:
+
+$$F = `r round(F12, 2)`, \quad Q = `r Q12`, \quad p `r ifelse(p12 < 0.001, "< 0.001", paste0("= ", round(p12, 3)))`$$
+
+Since we didn't do the F-test for each individual new piece of our sound model, we can say that the new features we have added are jointly significant (p `r ifelse(p12 < 0.001, "< 0.001", paste0("= ", round(p12, 3)))`). R² increases from `r round(r2_1, 4)` to `r round(r2_2, 4)`, which is a gain of `r round(r2_2 - r2_1, 4)`. The issue is that we should try to interpret this beyond the numbers, since the F-test has a lot of statistical power with over `r format(nrow(df_lag), big.mark=",")` data points. The difference in R² tells us that the previous song's audio qualities collectively explains less than 1% of the variation beyond what just the popularity was able to predict. This is statistically significant, but it tells us that most of the prediction was coming from the previous song's popularity rather than anything related to sound. 
+
+Something that is also good to note is the fact that our coefficient from Model 1 barely changes (as you can see from the table above), as it only changes by $`r round(abs(coef(m2)["prev_pop_resid"] - b1), 3)`$. This means that the audio features aren't meaningfully correlated with the popularity of the song, which means that whether your last song is popular is largely independent from what it sounded like. 
+
+One coefficient worth discussing is the large negative coefficient on `prev_energy` ($\hat{\gamma}_2 = `r round(coef(m2)["prev_energy"], 2)`$). This is probably due to instances where high-energy songs are then followed up by more relaxed, low key material, and the fact that it might be collinear with loudness and tempo, might have affected results rather than a true effect of energy on the popularity.  
+
+
+## Model 3: Does An Artist Selling Out Maintain Their Popularity?
+
+Our final model is the most expressive, and it adds an interaction term between the previous popularity and the sound change term that we mutated to our dataset.
+
+$$\text{pop\_resid}_n = \alpha + \beta_1 \cdot \text{pop\_resid}_{n-1} + \boldsymbol{\gamma}^\top \mathbf{x}_{n-1} + \delta \cdot (\text{pop\_resid}_{n-1} \times \text{sound\_change}_n) + \varepsilon_n$$
+The reason why we chose to multiply the two is because if we only added our sound change term by itself, then this would answer whether artists that changed their sound more have more popular next songs, regardless of how the previous song did. That doesn't really answer the question as to whether "selling out" works, since we want to know whether or not an artist chases the same sound as their hit. 
+
+For example, if we have two artists, and both had a song with a popularity score of 20, but one changed their sound a lot and the other one didn't. Does the artist that changed their sound less (stuck to what worked and sold out) lead to more popularity for their next song?
+
+```{r model3}
+m3 <- lm(pop_resid ~ prev_pop_resid +
+           sound_change +
+           prev_danceability + prev_energy + prev_loudness +
+           prev_acousticness + prev_valence + prev_tempo +
+           prev_pop_resid:sound_change,
+         data = df_lag)
+
+
+se3  <- sqrt(diag(vcovCL(m3, cluster = ~track_artist)))
+r2_3 <- summary(m3)$r.squared
+
+b3   <- coef(m3)["prev_pop_resid"]
+int3 <- coef(m3)["prev_pop_resid:sound_change"]
+se_int3 <- se3["prev_pop_resid:sound_change"]
+
+
+ci3_lo <- int3 - 1.96 * se_int3
+ci3_hi <- int3 + 1.96 * se_int3
+
+rss3 <- sum(resid(m3)^2)
+Q23  <- length(coef(m3)) - length(coef(m2))
+f_test_23 <- waldtest(m2, m3, vcov = vcovCL(m3, cluster = ~track_artist))
+F23 <- f_test_23$F[2]
+p23 <- f_test_23$`Pr(>F)`[2]
+
+# Effective persistence at p25 and p75 of sound change
+sc_p25 <- quantile(df_lag$sound_change, 0.25)
+sc_p75 <- quantile(df_lag$sound_change, 0.75)
+eff_p25 <- b3 + int3 * sc_p25
+eff_p75 <- b3 + int3 * sc_p75
+
+m2_coefs <- round(coef(m2)[c("prev_pop_resid", "prev_danceability", "prev_energy",
+                              "prev_loudness", "prev_acousticness",
+                              "prev_valence", "prev_tempo")], 3)
+
+m3_coefs <- round(coef(m3)[c("prev_pop_resid", "prev_danceability", "prev_energy",
+                              "prev_loudness", "prev_acousticness",
+                              "prev_valence", "prev_tempo",
+                              "prev_pop_resid:sound_change")], 3)
+
+simple_tbl2 <- data.frame(
+  Variable = c("prev pop resid", "prev danceability", "prev energy",
+               "prev loudness", "prev acousticness", "prev valence",
+               "prev tempo", "prev pop resid x sound change"),
+  `Model 2` = c(as.character(m2_coefs), "---"),
+  `Model 3` = as.character(m3_coefs)
+)
+
+kable(simple_tbl2, booktabs = TRUE,
+      col.names = c("Variable", "Model 2", "Model 3"),
+      caption = "Comparing coefficients between Model 2 and Model 3.") %>%
+  kable_styling(latex_options = "hold_position", font_size = 9)
+```
+
+Our interaction term coefficient gave us $\hat{\delta} = `r round(int3, 4)`$ (SE = `r round(se_int3, 4)`).
+
+When we did our F-test to compare between Model 2 and 3
+
+$$F = `r round(F23, 2)`, \quad Q = `r Q23`, \quad p `r ifelse(p23 < 0.001, "< 0.001", paste0("= ", round(p23, 3)))`$$
+The interaction is positive and highly significant, which tells us that artists who changed their sound more after a hit tended to keep their popularity more than artists that kept to the sound that made them big. This is surprising, as this tells us that it isn't valuable to "sell out" and stick to your sound, and that it is a much better commercial idea to deviate from your hit. However, this could be for a couple of reasons. First, it could be that if an artist makes a hit with the music that they normally made, they are pushed by their label or external pressure to "sell out" and change their sound away because they believe that it's what their audience wants to hear. 
+
+A summary that is easier to understand than just the raw interaction coefficient is to look at the effective persistence coefficient $\hat{\beta}$ at different levels of sound change. At the 25th percentile of sound change (sound\_change = `r round(sc_p25, 3)`), the effective $\hat{\beta} = `r round(eff_p25, 3)`$. while at the 75th percentile (sound\_change = `r round(sc_p75, 3)`), the effective $\hat{\beta} = `r round(eff_p75, 3)`$. Artists who changed their sound substantially actually maintained a larger fraction of their previous song's popularity, which is exactly the opposite of what a "sell out and repeat your hit" strategy would predict.
+
+```{r model3-viz, fig.width=5.5, fig.height=2.6, out.width="70%", fig.cap="How the effective popularity persistence coefficient changes with the degree of sound change. Artists who changed their sound more (right side) showed greater popularity persistence. The shaded band is the pointwise 95\\% uncertainty interval derived from clustered standard errors. Dashed lines mark the 25th and 75th percentiles."}
+
+
+sc_grid <- seq(0, quantile(df_lag$sound_change, 0.98), length.out = 200)
+
+V3          <- vcovCL(m3, cluster = ~track_artist)
+var_b3      <- V3["prev_pop_resid", "prev_pop_resid"]
+var_int3    <- V3["prev_pop_resid:sound_change", "prev_pop_resid:sound_change"]
+cov_b3_int3 <- V3["prev_pop_resid", "prev_pop_resid:sound_change"]
+
+eff_beta <- b3 + int3 * sc_grid
+eff_se   <- sqrt(var_b3 + sc_grid^2 * var_int3 + 2 * sc_grid * cov_b3_int3)
+
+eff_df <- data.frame(
+  sound_change = sc_grid,
+  eff_beta     = eff_beta,
+  lo           = eff_beta - 1.96 * eff_se,
+  hi           = eff_beta + 1.96 * eff_se
+)
+
+ggplot(eff_df, aes(x = sound_change, y = eff_beta)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), fill = "#2166ac", alpha = 0.15) +
+  geom_line(color = "#2166ac", linewidth = 1.0) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = sc_p25, linetype = "dotted",
+             color = "#d6604d", linewidth = 0.7) +
+  geom_vline(xintercept = sc_p75, linetype = "dotted",
+             color = "#d6604d", linewidth = 0.7) +
+  annotate("text", x = sc_p25, y = min(eff_df$lo) + 0.02,
+           label = "Q25", color = "#d6604d", size = 2.8, hjust = -0.1) +
+  annotate("text", x = sc_p75, y = min(eff_df$lo) + 0.02,
+           label = "Q75", color = "#d6604d", size = 2.8, hjust = -0.1) +
+  labs(
+    x = "Sound change (Euclidean distance in danceability-energy-valence space)",
+    y = expression(paste("Effective popularity persistence (", hat(beta), ")")),
+    title = "Model 3: How sound change modifies popularity persistence"
+  ) +
+  theme_classic(base_size = 9)
+```
+
+The upward slope that we see is really surprising, since artists who deviated more from their previous sound maintained more of their popularity, not less. 
+
+
+## Genre Subgroup Analysis
+
+```{r genre-subgroup, fig.width=5.5, fig.height=2.6, out.width="70%", fig.cap="Estimated interaction coefficient from Model 3 fit separately per genre. Error bars show 95\\% confidence intervals with cluster-robust SEs. A consistent positive sign across genres indicates the pooled result is not driven by a single genre."}
+
+
+genre_results <- df_lag %>%
+  group_by(playlist_genre) %>%
+  filter(n() >= 100) %>%
+  group_map(~{
+    tryCatch({
+      fit <- lm(pop_resid ~ prev_pop_resid +
+                  prev_danceability + prev_energy + prev_loudness +
+                  prev_acousticness + prev_valence + prev_tempo +
+                  prev_pop_resid:sound_change,
+                data = .x)
+      if (n_distinct(.x$track_artist) < 5) return(NULL)
+      se_cl    <- sqrt(diag(vcovCL(fit, cluster = ~track_artist)))
+      coef_int <- coef(fit)["prev_pop_resid:sound_change"]
+      se_int   <- se_cl["prev_pop_resid:sound_change"]
+      data.frame(
+        genre     = .y$playlist_genre,
+        coef      = coef_int,
+        se        = se_int,
+        n         = nrow(.x),
+        n_artists = n_distinct(.x$track_artist)
+      )
+    }, error = function(e) NULL)
+  }, .keep = TRUE) %>%
+  bind_rows()
+
+ggplot(genre_results, aes(x = reorder(genre, coef), y = coef)) +
+  geom_point(size = 2.5, color = "#2166ac") +
+  geom_errorbar(aes(ymin = coef - 1.96*se, ymax = coef + 1.96*se),
+                width = 0.25, color = "#2166ac") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  coord_flip() +
+  labs(
+    x = "Genre",
+    y = expression(paste("Interaction coef. (", hat(delta), " for prev_pop_resid x sound_change)")),
+    title = "Model 3 interaction by genre"
+  ) +
+  theme_classic(base_size = 9)
+```
+
+Running Model 3 separately within each genre is how we check on whether the pooled result is being dominated by a single genre. The interaction is positive for pop, EDM, rap, and R&B, but slightly negative for rock and latin music. However, neither of the negative coefficients is significantly different from zero, and no single genre's CI excludes zero either, which tells us that the pooled positive estimate isn't being driven by any single genre. 
+
+## Analyzing Direction of Sound Change
+
+```{r direction-model, include=FALSE}
+m3_dir <- lm(pop_resid ~ prev_pop_resid + centroid_approach +
+               prev_danceability + prev_energy + prev_loudness +
+               prev_acousticness + prev_valence + prev_tempo +
+               prev_pop_resid:centroid_approach,
+             data = df_lag)
+
+se3_dir      <- sqrt(diag(vcovCL(m3_dir, cluster = ~track_artist)))
+int3_dir     <- coef(m3_dir)["prev_pop_resid:centroid_approach"]
+se_int3_dir  <- se3_dir["prev_pop_resid:centroid_approach"]
+r2_3_dir     <- summary(m3_dir)$r.squared
+
+m3_full <- lm(pop_resid ~ prev_pop_resid + sound_change_full +
+                prev_danceability + prev_energy + prev_loudness +
+                prev_acousticness + prev_valence + prev_tempo +
+                prev_pop_resid:sound_change_full,
+              data = df_lag)
+
+se3_full     <- sqrt(diag(vcovCL(m3_full, cluster = ~track_artist)))
+int3_full    <- coef(m3_full)["prev_pop_resid:sound_change_full"]
+se_int3_full <- se3_full["prev_pop_resid:sound_change_full"]
+r2_3_full    <- summary(m3_full)$r.squared
+
+```
+
+
+While our primary `sound_change` variable measures how much an artist changed their sound, it doesn't tell us which direction they went. Our `centroid_approach` variable addresses this, since positive values mean the artist moved toward the mainstream of the genre. Using `centroid_approach` as the interaction variable gives $\hat{\delta}_{\text{dir}} = `r round(int3_dir, 4)`$ (cluster-robust SE = `r round(se_int3_dir, 4)`). This isn't statistically significant since the 95% CI straddles zero, so while we can say that the magnitude of an artist's sound change matters, we cannot make any claim that moving toward or away from the genre mainstream is what drives the effect. 
+
+
+```{r robustness-table}
+
+rob_tbl <- data.frame(
+  Specification = c(
+    "Primary (3-feature magnitude)",
+    "Directional (centroid)",
+    "Alternative (9-feature, z-scored)"
+  ),
+  Coef = unname(c(round(int3, 4), round(int3_dir, 4), round(int3_full, 4))),
+  SE   = unname(c(round(se_int3, 4), round(se_int3_dir, 4), round(se_int3_full, 4))),
+  CI   = c(
+    paste0("(", round(int3     - 1.96*se_int3,     4), ", ", round(int3     + 1.96*se_int3,     4), ")"),
+    paste0("(", round(int3_dir - 1.96*se_int3_dir, 4), ", ", round(int3_dir + 1.96*se_int3_dir, 4), ")"),
+    paste0("(", round(int3_full- 1.96*se_int3_full,4), ", ", round(int3_full+ 1.96*se_int3_full,4), ")")
+  ),
+  R2   = c(round(r2_3, 4), round(r2_3_dir, 4), round(r2_3_full, 4)),
+  row.names = NULL,
+  check.names = FALSE
+)
+
+kable(rob_tbl, booktabs = TRUE,
+      col.names = c("Specification","Coef.","SE","95% CI","R²"),
+      caption = "Robustness of the Model 3 interaction term across sound-change specifications. 95\\% CIs derived from cluster-robust SEs.") %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 9)
+
+```
+
+# Critical Analysis
+
+## Understanding Regression to the Mean
+
+As discussed previously, our coefficient from Model 1 comparing popularity between consecutive songs $\hat{\beta} = `r round(b1, 3)`$ has 2 pieces to it that we can't explain separately. the first being actual popularity and momentum for the artist, or the idea that the hit adds new listeners to the artist, which increases the chances that the next song gets more listeners as well. The second is statistical noise, which is what causes regression to the mean. We know that some of the current popularity is just due to noise, and "lucky" noise will always vanish over data points. The coefficient $`r round(b1, 3)`$ tells us `r round(rtm*100, 1)`% of excess popularity reverts, but not how much reflects luck running out versus momentum fading.
+
+For Model 3's interaction term, the 95% CI is $(`r round(ci3_lo, 4)`, `r round(ci3_hi, 4)`)$, which lies entirely above zero, supporting the idea that artists who change their sound after a hit maintain more popularity. However, the true effect of this isn't too high, since across the IQR of `sound_change`, effective $\hat{\beta}$ shifts by only $`r round(int3 * (sc_p75 - sc_p25), 3)`$.
+
+
+## Omitted Variable Bias
+The most important omitted variable would be external support and investment, specifically from a label. After a hit, a label will likely start to put significantly more investment into an artist, assuming that the hit that they made means that they can appeal to a large audience. Applying the omitted variable bias formula $\widehat{\text{Bias}} = \hat{\delta} \cdot \hat{\gamma}$, and since promotion raises popularity, $\hat{\gamma} > 0$, and since hits get more promotion, $\hat{\delta} > 0$. Referring to the formula, this means that our persistence coefficient is biased upward. This also is very important as to how we interpret our understanding in Model 3, since if labels promote artists after a hit and encourage them to "sell out" and go mainstream with their sound, then our mutated variable might actually be highly correlated with label investment, and might not be truly indicative of future popularity. 
+
+## Data Collection and Generalizability
+
+Analyzing the dataset itself is super important, since is sampled from editorial playlists, which likely oversamples from commercially successful artists, which are probably those most likely to "sell out". Doing some research into factors influencing popularity, evidence suggests that music popularity is largely shaped by social factors, and is very dependent on the time, not necessarily the quality of the music itself (Salganik, Dodds, & Watts, 2006; Askin & Mauskapf, 2017). This makes it extremely difficult to use any sort of model that solely is a function of audio features as a true model for this problem.
+
+
+
+
+# Conclusion
+
+
+For a particular artist, we found that their song popularity on Spotify sticks around across releases. Specifically, only `r round(rtm*100, 1)`% of any popularity regresses to the genre mean between songs ($\hat{\beta} = `r round(b1, 3)`$, R² = `r round(r2_1, 3)`). From our second model, we found that the audio profile of the previous song adds very little effect to the popularity of a song besides just the previous song's popularity (F = `r round(F12, 1)`, p `r ifelse(p12 < 0.001, "< 0.001", paste0("= ", round(p12,3)))`, $\Delta$R² = `r round(r2_2 - r2_1, 3)`). The most interesting result that we found is that artists who changed their sound more after a hit were more likely to keep their popularity over time ($\hat{\delta} = `r round(int3, 3)`$, $t = `r round(int3/se_int3, 1)`$, p `r ifelse(p23 < 0.001, "< 0.001", paste0("= ", round(p23,3)))`).
+
+However, what is important to note across all three of our models is that the features that we have selected, both audio features and popularity, explain only about `r round(r2_3*100, 0)`% of the variation in popularity between songs. There are other drivers of success that we haven't discussed, those being omitted variables such as label investment, cultural environment, and even whether or not there was a popular meme surrounding the song, which likely also signficantly drive song popularity (Salganik et al., 2006).
+
+
+There are some interesting practical implications of our results for those who are in the music industry. Our results tell us that artists shouldn't consider selling out to be a good way to become successful, since it looks like being more creative with your sound doesn't hurt you, and regression to the mean seems to get rid of popularity no matter what you do. For music labels, it seems that over-investing on a single hit would not be a great idea, since there is strong reversion ($1 - \hat{\beta} \approx `r round(rtm, 2)`$). Ultimately, this analysis indicates that popularity is noisy enough that selling out doesn't seem to be an ideal way to go as an artist. 
+
+
+# References
+
+Askin, N., & Mauskapf, M. (2017). What makes popular culture popular? Product features and optimal differentiation in music. *American Sociological Review, 82*(5), 910–944.
+
+Galton, F. (1886). Regression towards mediocrity in hereditary stature. *Journal of the Anthropological Institute of Great Britain and Ireland, 15*, 246–263.
+
+Salganik, M. J., Dodds, P. S., & Watts, D. J. (2006). Experimental study of inequality and unpredictability in an artificial cultural market. *Science, 311*(5762), 854–856.
+
+Spotify for Developers. (2023). *Audio features object.* https://developer.spotify.com/documentation/web-api/
+
+Thompson, R. (2020). How streaming reshaped the sound of popular music. *The Atlantic.* https://www.theatlantic.com
