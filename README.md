@@ -2,28 +2,28 @@
 
 A panel-data regression study of whether a song's popularity persists across an
 artist's career, and whether changing your sound after a hit helps or hurts the
-next release. Built in R, the project is framed as an **inference** problem
-(understanding a mechanism) rather than a prediction problem, with a focus on
+next release. Built in R, this project is as an **inference** problem
+rather than a prediction problem, with emphasis on
 **regression to the mean**.
 
 ---
 
-## TL;DR — Key Findings
+## Key Findings
 
-- **Popularity is sticky, but mostly reverts.** A song's genre-adjusted popularity
-  carries a coefficient of **β ≈ 0.316** onto the next song. That means roughly
-  **68%** of any unexpected popularity ("excess" above the artist's genre baseline)
+- **Popularity is sticky but mostly reverts.** A song's genre-adjusted popularity
+  carries a coefficient of **β ≈ 0.316** onto the next song, meaning roughly
+  **68%** of any unexpected popularity—"excess" above the artist's genre baseline—
   regresses to the mean by the following release.
 - **Sound alone explains almost nothing.** Adding six audio features of the previous
   song was jointly significant (F = 9.4, p < 0.001) but raised R² by only ~0.007 —
   a reminder that statistical significance at n ≈ 8,000 is not the same as a
   meaningful effect.
-- **Changing your sound did *not* hurt — if anything, it helped.** The interaction
-  between previous popularity and the *magnitude* of sound change was positive and
+- **Changing sound does not hurt, and if anything, it helps.** The interaction
+  between previous popularity and the magnitude of sound change was positive and
   significant (δ ≈ 0.162, p < 0.001). Artists who changed their sound more after a
   hit retained slightly more popularity, the opposite of what a "sell out and repeat
   the formula" strategy predicts.
-- **Direction didn't matter.** Moving *toward* vs. *away from* the genre mainstream
+- **Direction does not matter.** Moving toward vs. away from the genre mainstream
   showed no significant effect (δ ≈ −0.013, CI straddles zero).
 - **All models together explain only ~11% of variance**, consistent with prior work
   showing music success is driven heavily by social/timing factors outside audio
@@ -35,8 +35,8 @@ next release. Built in R, the project is framed as an **inference** problem
 
 1. **Persistence.** If a song outperforms its genre average, does the artist's *next*
    song tend to do the same?
-2. **Sound & strategy.** Does the previous song's sound — and the decision to change
-   it — predict the popularity of the next song? In other words, does "selling out"
+2. **Sound & strategy.** Does the previous song's sound—and the decision to change
+   it—predict the popularity of the next song? In other words, does "selling out"
    actually work commercially?
 
 ---
@@ -52,10 +52,7 @@ next release. Built in R, the project is framed as an **inference** problem
 | Final unit of analysis | **8,009 cross-album consecutive song pairs** from 1,202 artists |
 | Genres | EDM, Latin, Pop, R&B, Rap, Rock |
 
-> **Note on the data source:** `spotify_songs.csv` is a third-party dataset, not
-> original to this project. If you know the original source (e.g. a Kaggle page or
-> the TidyTuesday 2020-01-21 release), add the link here so others can trace
-> provenance and check licensing terms.
+> Dataset Source: https://www.kaggle.com/datasets/joebeachcapital/30000-spotify-songs
 
 The unit of observation is a **consecutive pair of songs by the same artist, across
 album cycles** — i.e. `(song n−1, song n)`. Intra-album pairs are dropped because
@@ -113,7 +110,7 @@ measure, and with a 9-feature z-scored measure.
 | `spotify_regression.pdf` | Knitted report with narrative, figures, and tables |
 | `spotify_songs.csv` | Input dataset (~7.7 MB) |
 | `README.md` | This file |
-| `LICENSE` | MIT license (covers the code/analysis) |
+| `LICENSE` | MIT license |
 
 ---
 
