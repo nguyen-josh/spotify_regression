@@ -654,7 +654,3 @@ Askin, N., & Mauskapf, M. (2017). What makes popular culture popular? Product fe
 Galton, F. (1886). Regression towards mediocrity in hereditary stature. *Journal of the Anthropological Institute of Great Britain and Ireland, 15*, 246–263.
 
 Salganik, M. J., Dodds, P. S., & Watts, D. J. (2006). Experimental study of inequality and unpredictability in an artificial cultural market. *Science, 311*(5762), 854–856.
-
-Spotify for Developers. (2023). *Audio features object.* https://developer.spotify.com/documentation/web-api/
-
-Thompson, R. (2020). How streaming reshaped the sound of popular music. *The Atlantic.* https://www.theatlantic.com
