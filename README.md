@@ -2,8 +2,7 @@
 
 A panel-data regression study of whether a song's popularity persists across an
 artist's career, and whether changing your sound after a hit helps or hurts the
-next release. Built in R, this project is as an **inference** problem
-rather than a prediction problem, with emphasis on
+next release. Built in R, this project is an **inference** problem with emphasis on
 **regression to the mean**.
 
 ---
